@@ -16,6 +16,7 @@
 import { describe, it, expect } from 'bun:test';
 import {
   chromaCmdlineNamesExactDataDir,
+  macPsCommandEncoding,
   parseLinuxProcStat,
   parseMacProcessTable,
   reclaimOrphanChromaDataDirWriters,
@@ -172,6 +173,25 @@ describe('reclaimOrphanChromaDataDirWriters', () => {
     expect(killed).toEqual([]);
   });
 
+  it('kills a macOS orphan whose non-ASCII data dir ps printed vis-encoded under LC_ALL=C', async () => {
+    // What `LC_ALL=C ps -eo pid=,ppid=,uid=,lstart=,command=` prints for a
+    // sidecar of the store "/Users/u/Données à garder/chroma": é (c3 a9) is
+    // M-CM-), à (c3 a0) is M-C\240.
+    const stdout = '91234     1   501 Sun Oct 12 14:22:01 2026     /Users/u/.local/share/uv/tools/chroma-mcp/bin/python3.13 '
+      + '/Users/u/.local/share/uv/tools/chroma-mcp/bin/chroma-mcp --client-type persistent '
+      + '--data-dir /Users/u/DonnM-CM-)es M-C\\240 garder/chroma\n';
+    const killed: number[] = [];
+    const result = await reclaimOrphanChromaDataDirWriters({
+      readTable: async () => parseMacProcessTable(stdout),
+      dataDir: () => '/Users/u/Données à garder/chroma',
+      ownUid: () => 501,
+      platform: 'darwin',
+      killTree: async pid => { killed.push(pid); },
+    });
+    expect(result.killedPids).toEqual([91234]);
+    expect(killed).toEqual([91234]);
+  });
+
   it('stops between kills once the connection is cancelled', async () => {
     let owns = true;
     const killed: number[] = [];
@@ -204,6 +224,39 @@ describe('chromaCmdlineNamesExactDataDir', () => {
     expect(chromaCmdlineNamesExactDataDir(`chroma-mcp --data-dir ${DATA_DIR}/x`, DATA_DIR, 'linux')).toBe(false);
     expect(chromaCmdlineNamesExactDataDir(`chroma-mcp --data-dir ${DATA_DIR}-data`, DATA_DIR, 'linux')).toBe(false);
     expect(chromaCmdlineNamesExactDataDir('chroma-mcp', DATA_DIR, 'linux')).toBe(false);
+  });
+
+  it('on macOS, also matches the encoded form ps prints for a non-ASCII data dir', () => {
+    const store = '/Users/u/Données/chroma';
+    const printed = 'chroma-mcp --client-type persistent --data-dir /Users/u/DonnM-CM-)es/chroma';
+    expect(chromaCmdlineNamesExactDataDir(printed, store, 'darwin')).toBe(true);
+    // /proc and CIM report argv verbatim: there, that text is some other directory.
+    expect(chromaCmdlineNamesExactDataDir(printed, store, 'linux')).toBe(false);
+    expect(chromaCmdlineNamesExactDataDir(printed, store, 'win32')).toBe(false);
+    // A different non-ASCII store (è, c3 a8) is still a different store.
+    expect(chromaCmdlineNamesExactDataDir(printed.replace('M-)', 'M-('), store, 'darwin')).toBe(false);
+  });
+});
+
+describe('macPsCommandEncoding', () => {
+  // Expected values follow strvis(VIS_TAB | VIS_NL | VIS_NOSLASH) byte by byte
+  // in the C locale (Libc gen/FreeBSD/vis.c): a high byte is M plus -c or ^c
+  // for its low seven bits, except a0, which, like tab and newline, is octal.
+  it('passes printable ASCII through unchanged, space and backslash included', () => {
+    const ascii = '/Users/A B/.claude-mem/chroma ~!@#$%^&*()[]{}|\\;:\'",<.>?`=+_-';
+    expect(macPsCommandEncoding(ascii)).toBe(ascii);
+  });
+
+  it('encodes every byte of a non-ASCII character on its own', () => {
+    expect(macPsCommandEncoding('é')).toBe('M-CM-)'); // c3 a9
+    expect(macPsCommandEncoding('à')).toBe('M-C\\240'); // c3 a0
+    expect(macPsCommandEncoding('データ')).toBe('M-cM^CM^GM-cM^CM-<M-cM^BM-?'); // e3 83 87 e3 83 bc e3 82 bf
+    expect(macPsCommandEncoding('🧠')).toBe("M-pM^_M-'\\240"); // f0 9f a7 a0
+  });
+
+  it('writes tab and newline in octal and other control bytes in caret notation', () => {
+    expect(macPsCommandEncoding('a\tb\nc')).toBe('a\\011b\\012c');
+    expect(macPsCommandEncoding('\x01\x1b\x7f')).toBe('^A^[^?');
   });
 });
 

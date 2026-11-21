@@ -278,7 +278,8 @@ export function parseLinuxProcStat(raw: string): { ppid: number; startToken: str
  * this platform — the same agreement readProcessTablePosix() in
  * kill-process-tree.ts relies on (and asserts by test). LC_ALL/LANG are
  * pinned so a locale-formatted date would not compare unequal on the
- * revalidation.
+ * revalidation. The pin also means `command=` shows non-ASCII bytes in their
+ * vis(3) encoding, never verbatim: see macPsCommandEncoding.
  */
 async function readMacProcessTableWithNames(capMs?: number): Promise<WindowsProcessRow[]> {
   let stdout: string;
@@ -321,6 +322,33 @@ export function parseMacProcessTable(stdout: string): WindowsProcessRow[] {
     });
   }
   return rows;
+}
+
+/**
+ * What macOS `ps -o command=` prints for `text` under the LC_ALL=C that
+ * readMacProcessTableWithNames pins. ps passes each command line through
+ * strvis(3) with VIS_TAB | VIS_NL | VIS_NOSLASH (adv_cmds ps/print.c), and the
+ * C locale can print no byte above 0x7f, so every byte of a non-ASCII character
+ * is encoded on its own (Libc gen/FreeBSD/vis.c, do_mbyte): `é` (c3 a9) prints
+ * as `M-CM-)`, an a0 byte as `\240`, a control byte as `^X`. Printable ASCII,
+ * space included, passes through, so an ASCII path is its own encoding.
+ * Pure; exported for tests.
+ */
+export function macPsCommandEncoding(text: string): string {
+  let encoded = '';
+  for (const byte of Buffer.from(text, 'utf8')) {
+    if (byte >= 0x20 && byte <= 0x7e) {
+      encoded += String.fromCharCode(byte);
+    } else if (byte === 0x09 || byte === 0x0a || byte === 0xa0) {
+      // Tab and newline (VIS_TAB, VIS_NL) and a "meta space" print in octal, backslash and all.
+      encoded += `\\${byte.toString(8).padStart(3, '0')}`;
+    } else {
+      const low = byte & 0x7f;
+      encoded += (byte & 0x80 ? 'M' : '')
+        + (low < 0x20 || low === 0x7f ? `^${low === 0x7f ? '?' : String.fromCharCode(low + 0x40)}` : `-${String.fromCharCode(low)}`);
+    }
+  }
+  return encoded;
 }
 
 /**
@@ -935,7 +963,11 @@ export function chromaCmdlineNamesExactDataDir(
     const slashed = dir.replace(/\\/g, '/').replace(/\/+$/, '');
     return caseInsensitive ? slashed.toLowerCase() : slashed;
   };
-  return normalize(value) === normalize(dataDir);
+  const observed = normalize(value);
+  if (observed === normalize(dataDir)) return true;
+  // /proc (Linux) and CIM (Windows) report argv verbatim, but macOS rows come
+  // from `ps` under LC_ALL=C, which prints a non-ASCII data dir encoded.
+  return platform === 'darwin' && observed === normalize(macPsCommandEncoding(dataDir));
 }
 
 /**
