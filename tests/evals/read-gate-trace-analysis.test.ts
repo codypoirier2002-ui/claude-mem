@@ -407,7 +407,7 @@ describe('processesStillUsingArm', () => {
     return { calls, query };
   }
 
-  it('merges what pgrep and lsof find, drops this process, and gives pgrep the data dir as a literal pattern', () => {
+  it('merges what pgrep and lsof find, drops this process, and gives pgrep the data dir as an escaped pattern', () => {
     const { calls, query } = answering({
       pgrep: { status: 0, signal: null, stdout: `4100\n${process.pid}\n`, stderr: '' },
       lsof: { status: 0, signal: null, stdout: '4100\n4200\n', stderr: '' },
@@ -415,7 +415,8 @@ describe('processesStillUsingArm', () => {
 
     expect(processesStillUsingArm(arm, query)).toEqual([4100, 4200]);
     expect(calls).toEqual([
-      ['pgrep', ['-f', '--', '/work/claude-mem 🧠 \\(copy\\)/\\.scratch/read-gate-eval/t/on/data']],
+      // 🧠 is four UTF-8 bytes, which procps-ng pgrep shows as `????` in the C locale.
+      ['pgrep', ['-f', '--', '/work/claude-mem .{1,4} \\(copy\\)/\\.scratch/read-gate-eval/t/on/data']],
       ['lsof', ['-nP', '-iTCP:51234', '-sTCP:LISTEN', '-t']],
     ]);
   });
@@ -452,16 +453,22 @@ describe('processesStillUsingArm', () => {
   });
 
   it.skipIf(!Bun.which('pgrep') || !Bun.which('lsof'))(
-    'finds a process whose command line carries a data dir full of regex metacharacters, with the real pgrep and lsof',
+    'finds a process whose command line carries a data dir full of regex metacharacters and non-ASCII, with the real pgrep and lsof, in any locale',
     async () => {
-      const dataDirectory = '/no/such/claude-mem 🧠 (1) a+b [c] {2} |^$?* back\\slash/.scratch/on/data';
+      // é, データ and 🧠 are 2, 3 and 4 UTF-8 bytes each; procps-ng pgrep shows every one of those bytes as `?` in the C locale.
+      const dataDirectory = '/no/such/claude-mem 🧠 José データ (1) a+b [c] {2} |^$?* back\\slash/.scratch/on/data';
       const listener = net.createServer();
       await new Promise<void>(resolve => listener.listen(0, '127.0.0.1', resolve));
       const port = (listener.address() as net.AddressInfo).port;
       const child = Bun.spawn([process.execPath, '-e', 'setTimeout(() => {}, 30000)', dataDirectory], { stdout: 'ignore', stderr: 'ignore' });
+      const inLocale = (locale: string) => (command: string, args: string[]) =>
+        spawnSync(command, args, { encoding: 'utf8', env: { ...process.env, LC_ALL: locale } });
       try {
         // lsof finds this test process on the port, which is dropped like the runner itself.
-        expect(processesStillUsingArm({ name: 'on', dataDirectory, port })).toEqual([child.pid]);
+        // The inherited locale, then C (a runner already in a UTF-8 locale would never exercise it), then C.UTF-8.
+        for (const [locale, query] of [['inherited', undefined], ['C', inLocale('C')], ['C.UTF-8', inLocale('C.UTF-8')]] as const) {
+          expect({ locale, pids: processesStillUsingArm({ name: 'on', dataDirectory, port }, query) }).toEqual({ locale, pids: [child.pid] });
+        }
       } finally {
         child.kill();
         listener.close();

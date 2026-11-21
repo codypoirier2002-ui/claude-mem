@@ -639,9 +639,23 @@ type ProcessQuery = (
   args: string[],
 ) => Pick<SpawnSyncReturns<string>, 'error' | 'status' | 'signal' | 'stdout' | 'stderr'>;
 
-/** `text` as a POSIX extended regex that matches only itself: `pgrep -f` takes a regex, and a checkout path may hold `.`, `(` or `+`. */
-function extendedRegexLiteral(text: string): string {
-  return text.replace(/[.[\\()*+?{|^$]/g, '\\$&');
+/**
+ * `text` as the POSIX extended regex `pgrep -f` needs to find it. pgrep takes a regex and a
+ * checkout path may hold `.`, `(` or `+`, so those are escaped to match only themselves.
+ * Non-ASCII cannot be written literally: procps-ng matches the command line it has escaped for
+ * display, and in the C locale (Docker, CI images, cron) every byte it cannot print reads `?`,
+ * so `é` (two bytes) is `??` there and never equals a literal `é`. A character outside
+ * printable ASCII therefore matches one to as many characters as it has UTF-8 bytes: itself
+ * where pgrep shows it (a UTF-8 locale, or BSD pgrep, which reads raw argv) or its `?`s.
+ */
+function pgrepPattern(text: string): string {
+  let pattern = '';
+  for (const character of text) {
+    pattern += character >= ' ' && character <= '~'
+      ? character.replace(/[.[\\()*+?{|^$]/, '\\$&')
+      : `.{1,${Buffer.byteLength(character)}}`;
+  }
+  return pattern;
 }
 
 /**
@@ -667,7 +681,7 @@ export function processesStillUsingArm(
     }
     return pidsFrom(result.stdout ?? '');
   };
-  const byDataDirectory = pidsFoundBy('pgrep', ['-f', '--', extendedRegexLiteral(arm.dataDirectory)]);
+  const byDataDirectory = pidsFoundBy('pgrep', ['-f', '--', pgrepPattern(arm.dataDirectory)]);
   const byPort = pidsFoundBy('lsof', ['-nP', `-iTCP:${arm.port}`, '-sTCP:LISTEN', '-t']);
   return [...new Set([...byDataDirectory, ...byPort])].filter(pid => pid !== process.pid);
 }
